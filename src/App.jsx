@@ -1,10 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { API_BASE, clearStoredAuth, getStoredToken, getTcgHitList, getTradeHitListItems, loginDashboardUser, syncTradeHitListItem, updateHitListImageUrl } from './api.js';
+import { useHitListSettings } from './useHitListSettings.js';
 
-const DEFAULT_REFRESH_MS = 60_000;
 const DEFAULT_LIMIT = 120;
-const DEFAULT_PAGE_SIZE = 9;
-const PAGE_ROTATION_MS = 15_000;
 const FULL_SYNC_MS = 15 * 60_000;
 
 function getQueryParams() {
@@ -13,9 +11,10 @@ function getQueryParams() {
     game: params.get('game') || '',
     search: params.get('search') || '',
     compact: params.get('compact') === '1' || params.get('mode') === 'compact',
-    refreshMs: Math.max(15_000, Number(params.get('refreshMs')) || DEFAULT_REFRESH_MS),
     limit: Math.max(1, Math.min(250, Number(params.get('limit')) || DEFAULT_LIMIT)),
-    pageSize: Math.max(1, Math.min(60, Number(params.get('pageSize')) || DEFAULT_PAGE_SIZE)),
+    // URL params still override stored settings for backwards-compat.
+    pageSizeOverride: params.has('pageSize') ? Math.max(1, Math.min(60, Number(params.get('pageSize')))) : null,
+    refreshMsOverride: params.has('refreshMs') ? Math.max(15_000, Number(params.get('refreshMs'))) : null,
   };
 }
 
@@ -138,8 +137,83 @@ function LoginPanel({ onLogin }) {
   );
 }
 
+function SettingsModal({ settings, onUpdate, onReset, onClose }) {
+  const [draft, setDraft] = useState({ ...settings });
+
+  const set = (key, value) => setDraft(prev => ({ ...prev, [key]: value }));
+
+  const save = () => {
+    onUpdate(draft);
+    onClose();
+  };
+
+  return (
+    <div className="settings-overlay" role="dialog" aria-modal="true" aria-label="Display settings" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="settings-modal">
+        <div className="settings-modal__header">
+          <h2>Display Settings</h2>
+          <button type="button" className="settings-modal__close" onClick={onClose} aria-label="Close settings">✕</button>
+        </div>
+        <div className="settings-modal__body">
+          <label className="settings-field">
+            <span className="settings-field__label">Items per page</span>
+            <span className="settings-field__hint">Cards shown before advancing to the next page.</span>
+            <input
+              type="number" min={1} max={60} step={1}
+              value={draft.pageSize}
+              onChange={(e) => set('pageSize', Number(e.target.value))}
+            />
+          </label>
+          <label className="settings-field">
+            <span className="settings-field__label">Items per row</span>
+            <span className="settings-field__hint">Fixed grid column count. Set to 0 for auto/responsive layout.</span>
+            <input
+              type="number" min={0} max={10} step={1}
+              value={draft.columns}
+              onChange={(e) => set('columns', Number(e.target.value))}
+            />
+          </label>
+          <label className="settings-field">
+            <span className="settings-field__label">Data resync interval (seconds)</span>
+            <span className="settings-field__hint">How often to re-fetch prices from the API.</span>
+            <input
+              type="number" min={10} max={3600} step={5}
+              value={Math.round(draft.refreshMs / 1000)}
+              onChange={(e) => set('refreshMs', Number(e.target.value) * 1000)}
+            />
+          </label>
+          <label className="settings-field">
+            <span className="settings-field__label">Page advance interval (seconds)</span>
+            <span className="settings-field__hint">How long each page is shown before auto-advancing.</span>
+            <input
+              type="number" min={3} max={300} step={1}
+              value={Math.round(draft.pageRotationMs / 1000)}
+              onChange={(e) => set('pageRotationMs', Number(e.target.value) * 1000)}
+            />
+          </label>
+        </div>
+        <div className="settings-modal__footer">
+          <button type="button" className="settings-btn settings-btn--ghost" onClick={() => { onReset(); onClose(); }}>
+            Restore defaults
+          </button>
+          <button type="button" className="settings-btn" onClick={save}>
+            Save
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
-  const params = useMemo(getQueryParams, []);
+  const queryParams = useMemo(getQueryParams, []);
+  const { settings, update: updateSettings, reset: resetSettings } = useHitListSettings();
+  const [showSettings, setShowSettings] = useState(false);
+
+  // URL params override stored settings for backwards-compat.
+  const pageSize = queryParams.pageSizeOverride ?? settings.pageSize;
+  const refreshMs = queryParams.refreshMsOverride ?? settings.refreshMs;
+  const { pageRotationMs, columns } = settings;
   const [items, setItems] = useState([]);
   const [generatedAt, setGeneratedAt] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -156,9 +230,9 @@ function App() {
     try {
       setError('');
       const data = await getTcgHitList({
-        game: params.game,
-        search: params.search,
-        limit: params.limit,
+        game: queryParams.game,
+        search: queryParams.search,
+        limit: queryParams.limit,
       });
       setItems(Array.isArray(data?.items) ? data.items : []);
       setGeneratedAt(data?.generatedAt || null);
@@ -168,7 +242,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, [params.game, params.limit, params.search]);
+  }, [queryParams.game, queryParams.limit, queryParams.search]);
 
   useEffect(() => {
     load();
@@ -176,28 +250,28 @@ function App() {
 
   useEffect(() => {
     if (paused) return undefined;
-    const interval = window.setInterval(load, params.refreshMs);
+    const interval = window.setInterval(load, refreshMs);
     return () => window.clearInterval(interval);
-  }, [load, params.refreshMs, paused]);
+  }, [load, refreshMs, paused]);
 
   const games = useMemo(() => Array.from(new Set(items.map(item => item.tcgGame).filter(Boolean))).sort(), [items]);
-  const pageCount = Math.max(1, Math.ceil(items.length / params.pageSize));
+  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
   const pageItems = useMemo(() => {
-    const start = currentPage * params.pageSize;
-    return items.slice(start, start + params.pageSize);
-  }, [currentPage, items, params.pageSize]);
+    const start = currentPage * pageSize;
+    return items.slice(start, start + pageSize);
+  }, [currentPage, items, pageSize]);
 
   useEffect(() => {
     setCurrentPage(0);
-  }, [items.length, params.pageSize]);
+  }, [items.length, pageSize]);
 
   useEffect(() => {
     if (paused || pageCount <= 1) return undefined;
     const interval = window.setInterval(() => {
       setCurrentPage(page => (page + 1) % pageCount);
-    }, PAGE_ROTATION_MS);
+    }, pageRotationMs);
     return () => window.clearInterval(interval);
-  }, [pageCount, paused]);
+  }, [pageCount, paused, pageRotationMs]);
 
   const goToPage = useCallback((direction) => {
     if (pageCount <= 1) return;
@@ -213,7 +287,7 @@ function App() {
     const isAuto = trigger === 'auto';
     setManualSync({ active: true, completed: 0, total: 0, message: `${isAuto ? 'Auto sync' : 'Manual sync'}: finding hit list items…` });
     try {
-      const hitList = await getTradeHitListItems({ source: 'tcg', search: params.search, game: params.game });
+      const hitList = await getTradeHitListItems({ source: 'tcg', search: queryParams.search, game: queryParams.game });
       const ids = Array.isArray(hitList) ? hitList.map(item => item.id).filter(Boolean) : [];
       setManualSync({ active: true, completed: 0, total: ids.length, message: ids.length ? `${isAuto ? 'Auto syncing' : 'Syncing'} hit list…` : 'No TCG hit list items to sync.' });
 
@@ -235,7 +309,7 @@ function App() {
       }
       setManualSync({ active: false, completed: 0, total: 0, message: err?.response?.data?.message || err?.message || 'Manual sync failed.' });
     }
-  }, [authToken, load, manualSync.active, params.game, params.search]);
+  }, [authToken, load, manualSync.active, queryParams.game, queryParams.search]);
 
   useEffect(() => {
     if (!authToken) return undefined;
@@ -293,7 +367,7 @@ function App() {
   }
 
   return (
-    <main className={params.compact ? 'app app--compact' : 'app'}>
+    <main className={queryParams.compact ? 'app app--compact' : 'app'}>
       <header className="hero">
         <div>
           <p className="eyebrow">HOTTEST TCG ITEMS</p>
@@ -323,6 +397,14 @@ function App() {
             >
               {manualSync.active ? 'Syncing' : 'Sync'}
             </button>
+            <button
+              className="settings-toggle"
+              type="button"
+              onClick={() => setShowSettings(true)}
+              title="Display settings"
+            >
+              ⚙
+            </button>
             {authToken && (
               <button className="auth-toggle" type="button" onClick={signOut} title="Sign out">
                 ×
@@ -351,6 +433,15 @@ function App() {
       )}
       {showLogin && !authToken && <LoginPanel onLogin={(token) => { setAuthToken(token); setShowLogin(false); }} />}
 
+      {showSettings && (
+        <SettingsModal
+          settings={settings}
+          onUpdate={updateSettings}
+          onReset={resetSettings}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
+
       {!loading && items.length === 0 ? (
         <section className="empty-state">
           <div className="empty-icon">🃏</div>
@@ -358,12 +449,16 @@ function App() {
           <p>Pin JustTCG cards from the scanner with “+ Hit List” and they will appear here automatically.</p>
         </section>
       ) : (
-        <section className="grid" aria-live="polite">
+        <section
+          className="grid"
+          aria-live="polite"
+          style={columns > 0 ? { gridTemplateColumns: `repeat(${columns}, 1fr)` } : undefined}
+        >
           {pageItems.map(item => (
             <HitListCard
               key={item.id}
               item={item}
-              compact={params.compact}
+              compact={queryParams.compact}
               paused={paused}
               onEditImage={editImage}
             />
